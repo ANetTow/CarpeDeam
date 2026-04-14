@@ -33,3 +33,5 @@ src/workflow/time_test
 build/
 .idea/
 cmake-build-*/
+test_tmp/
+test_output.fasta
