@@ -68,7 +68,7 @@ static void readNucSubstitionRatesFreq(const string filename,vector<substitution
 	fields = allTokens(line,'\t');
 
 	if(fields.size() != 12){
-	    std::cerr << "Profile not 12 fields uniq1" << "\n";
+	    std::cerr << "Error: Profile header does not have 12 fields (tab-separated) in file: " << filename << "\n";
         exit(1);
 	}
 
@@ -79,7 +79,7 @@ static void readNucSubstitionRatesFreq(const string filename,vector<substitution
 	    fields = allTokens(line,'\t');
 
 	    if(fields.size() != 12){
-	    std::cerr << "Profile not 12 fields uniq2" << "\n";
+	    std::cerr << "Error: Profile line does not have 12 fields (tab-separated) in file: " << filename << "\n";
         exit(1);
 	    }
 
@@ -96,7 +96,7 @@ static void readNucSubstitionRatesFreq(const string filename,vector<substitution
 	}
 	subFP.close();
     }else{
-	    std::cerr << "Profile not 12 fields uniq3" << "\n";
+	    std::cerr << "Error: Unable to open profile file: " << filename << "\n";
         exit(1);
     }
 }
