@@ -3,28 +3,18 @@
 # CarpeDeam Pipeline — Ancient Chicken Cloaca Metagenomics (aDNA)
 #
 # Stages:
-#   ref_prep_targeted → Download microbial reference genomes based on previous SPAdes assembly and taxonomy
+#   ref_prep_targeted → Download microbial reference genomes
 #   merge_reads       → Merge paired reads (leeHom)
-#   map_damage        → Map merged reads → BAM; DamageProfiler → CarpeDeam *.prof damage matrices
-#   assemble_carpedeam→ Run CarpeDeam ancient_assemble with merged reads and damage matrix
-#
-# Notes:
-# - CarpeDeam requires merged reads + a strict tab-separated damage matrix (two files: *_5p.prof, *_3p.prof).  # See README. [7](https://link.springer.com/content/pdf/10.1186/s13059-025-03839-5.pdf)
-# - DamageProfiler computes 5′C→T and 3′G→A profiles on mapped reads; we convert these into CarpeDeam’s 12-column .prof format. [6](https://usdagcc-my.sharepoint.com/personal/annette_hynes_usda_gov/Documents/Microsoft%20Copilot%20Chat%20Files/Pen1-A10_S10_k2_khist.txt)
-# - Bowtie2 is used for single-end mapping of merged reads; index built once in ref_prep. [4](https://www.biostars.org/p/208696/)[5](https://www.biostars.org/p/485916/)
-# - leeHom is used for overlap-based merging.
+#   map_damage        → Map merged reads; compute damage; create .prof
+#   assemble_carpedeam→ Run CarpeDeam ancient_assemble
 #
 # Run order:
 # sbatch assembly_carpedeam.sh ref_prep_targeted
 # sbatch --array=0-1 assembly_carpedeam.sh merge_reads
 # sbatch --array=0-1 assembly_carpedeam.sh map_damage
-# sbatch --array=0-1 assembly_carpedeam.sh normalize_damage
 # sbatch --array=0-1 assembly_carpedeam.sh assemble_carpedeam
 ###############################################################################
 
-############################
-# SLURM CONFIGURATION
-############################
 #SBATCH --job-name="carpedeam"
 #SBATCH --time=48:00:00
 #SBATCH -A gbru_fy23_ancient_chickens
@@ -34,19 +24,26 @@
 #SBATCH --output=%x.%A_%a.out
 
 set -euo pipefail
+export LC_ALL=C
+export LANG=C
 
 ############################
-# GLOBAL PATHS
+# GLOBAL CONFIGURATION
 ############################
 STAGE="${1:-}"
-
 BASE="/project/gbru_fy23_ancient_chickens/annette"
 
-# Input reads
-RAW_READS="$BASE/reads"
-FILTERED_READS="$BASE/shortread/filtered_reads"   # from your host_filter stage (nochicken/nohuman → clean_final*.fq.gz)
+# Resource & Tool Config
+THREADS="${SLURM_CPUS_PER_TASK:-8}"
+DP_HEAP="${DP_HEAP:-16g}"
+DP_LEN="${DP_LEN:-100}"
+ADAPTER_F="${ADAPTER_F:-}"
+ADAPTER_R="${ADAPTER_R:-}"
+LEEHOM_OPTS=("--ancientdna" "--prob" "0.8")
 
-# Pipeline outputs
+# Input/Output Paths
+RAW_READS="$BASE/reads"
+FILTERED_READS="$BASE/shortread/filtered_reads"
 OUT_ROOT="$BASE/carpedeam"
 REF_DIR="$OUT_ROOT/ref"
 MERGE_DIR="$OUT_ROOT/merged"
@@ -55,11 +52,9 @@ DMG_DIR="$OUT_ROOT/damage"
 ASM_DIR="$OUT_ROOT/assembly"
 TMP_DIR="$OUT_ROOT/tmp"
 
-mkdir -p "$OUT_ROOT" "$REF_DIR" "$MERGE_DIR" "$MAP_DIR" "$DMG_DIR" "$ASM_DIR" "$TMP_DIR"
-
-# Reference outputs
-REF_FASTA="$REF_DIR/microbes_reference.fna"
-REF_INDEX_PREFIX="$REF_DIR/microbes_index"
+# Reference Files
+REF_FASTA="$REF_DIR/targeted_microbes.fna"
+REF_MMI="$REF_DIR/targeted_microbes.mmi"
 
 # Samples (Slurm array indexing 0..1)
 R1_FILES=(
@@ -71,38 +66,52 @@ R2_FILES=(
   "$RAW_READS/Pen9-B10_S22_L001_R2_001.fastq.gz"
 )
 
-THREADS="${SLURM_CPUS_PER_TASK:-8}"
+mkdir -p "$OUT_ROOT" "$REF_DIR" "$MERGE_DIR" "$MAP_DIR" "$DMG_DIR" "$ASM_DIR" "$TMP_DIR"
 
 ###############################################################################
-# Helper: resolve filtered vs raw paired reads for a SAMPLE
+# SAMPLE SETUP (Array-based)
 ###############################################################################
-reads_for_sample() {
-  local sample="$1"
-  local f1="$FILTERED_READS/${sample}.clean_final1.fq.gz"
-  local f2="$FILTERED_READS/${sample}.clean_final2.fq.gz"
+if [[ "$STAGE" != "ref_prep_targeted" && -n "$STAGE" ]]; then
+  idx="${SLURM_ARRAY_TASK_ID:-0}"
+  RAW_R1="${R1_FILES[$idx]}"
+  SAMPLE="$(basename "$RAW_R1" _R1_001.fastq.gz)"
 
-  if [[ -r "$f1" && -r "$f2" ]]; then
-    # Print each path on its own line, exactly as two separate records
-    printf '%s\n' "$f1" "$f2"
+  # Resolve raw vs filtered reads
+  F1="$FILTERED_READS/${SAMPLE}.clean_final1.fq.gz"
+  F2="$FILTERED_READS/${SAMPLE}.clean_final2.fq.gz"
+  if [[ -r "$F1" && -r "$F2" ]]; then
+    USE_R1="$F1"; USE_R2="$F2"
   else
-    local idx="${SLURM_ARRAY_TASK_ID:-0}"
-    local r1="${R1_FILES[$idx]}"
-    local r2="${R2_FILES[$idx]}"
-    printf '%s\n' "$r1" "$r2"
-    echo "[WARN] Filtered reads not found for $sample. Using RAW." >&2
+    USE_R1="$RAW_R1"; USE_R2="${R2_FILES[$idx]}"
+    echo "[WARN] Filtered reads not found for $SAMPLE. Using RAW." >&2
   fi
-}
+
+  # Common Stage Paths
+  DMG_PREFIX="$DMG_DIR/${SAMPLE}_CarpeDeam_"
+  F5P="${DMG_PREFIX}5p.prof"
+  F3P="${DMG_PREFIX}3p.prof"
+
+  # Merged reads preference (prefer min20 filtered if it exists)
+  MERGED_BASE="$MERGE_DIR/${SAMPLE}.merged"
+  if [[ -s "${MERGED_BASE}.min20.fq.gz" ]]; then
+    INPUT_MERGED="${MERGED_BASE}.min20.fq.gz"
+  else
+    INPUT_MERGED="${MERGED_BASE}.fq.gz"
+  fi
+
+  # Common output paths
+  BAM="$MAP_DIR/${SAMPLE}.merged.sorted.bam"
+  DP_OUT="$DMG_DIR/${SAMPLE}_damageprofiler"
+  ASM_OUT="$ASM_DIR/${SAMPLE}.carpedeam.fasta"
+  TMP_SUB="$TMP_DIR/${SAMPLE}"
+fi
 
 ###############################################################################
 # STAGE DISPATCH
 ###############################################################################
 case "$STAGE" in
 
-# ---------------------------------------------------------------------------
-# REF PREP (TARGETED) — use top_taxa_targets.tsv → download genomes → build Minimap2 index
-# ---------------------------------------------------------------------------
 ref_prep_targeted)
-  set -euo pipefail
   TOP_TSV="${2:-$REF_DIR/top_taxa_targets.tsv}"
   [[ ! -s "$TOP_TSV" ]] && { echo "[ERROR] top_taxa_targets.tsv not found at: $TOP_TSV" >&2; exit 1; }
 
@@ -111,643 +120,128 @@ ref_prep_targeted)
   TLIST="$REF_DIR/targeted_ncbi/targeted_taxa.list"
   : > "$TLIST"
 
-  # 0) Module hygiene: avoid python_3 conflicts, keep toolchain minimal
   module purge || true
-  module load minimap2 || true
-  module load samtools || true
+  module load minimap2 samtools || true
 
-  # 1) Select only species/genus rows with include=yes (skip higher ranks)
   awk -F'\t' 'NR>1 && $8=="yes" && ($3=="species" || $3=="genus") {print $1"\t"$2"\t"$3}' "$TOP_TSV" > "$TLIST"
-  NSEL=$(wc -l < "$TLIST" || echo 0)
-  [[ "$NSEL" -eq 0 ]] && { echo "[ERROR] No species/genus marked include=yes in $TOP_TSV"; exit 1; }
-  echo "[REF] Selected $NSEL taxa (species/genus) for download."
+  echo "[REF] Selected $(wc -l < "$TLIST") taxa for download."
 
-  # 2) Use a user-writable conda env under the project; avoid system base
   CONDA_SH="/software/el9/apps/miniconda/24.7.1-2/etc/profile.d/conda.sh"
-  if [[ -f "$CONDA_SH" ]]; then
-    . "$CONDA_SH"
-  else
-    echo "[WARN] conda.sh not found; ensure 'conda' is in PATH."
-  fi
-
+  [[ -f "$CONDA_SH" ]] && . "$CONDA_SH"
   USER_ENV="$OUT_ROOT/conda_env"
   if [[ ! -d "$USER_ENV" ]]; then
-    echo "[REF] Creating local env: $USER_ENV"
-    conda create -y -p "$USER_ENV" -c conda-forge -c bioconda ncbi-datasets-cli seqkit || {
-      echo "[ERROR] Could not create local Conda env at $USER_ENV"; exit 1; }
-  else
-    echo "[REF] Using existing env: $USER_ENV"
+    conda create -y -p "$USER_ENV" -c conda-forge -c bioconda ncbi-datasets-cli seqkit
   fi
 
-  # 3) Robust downloader: try RefSeq reps → RefSeq → GenBank reps → GenBank
   download_taxon() {
     local taxid="$1" tname="$2" rank="$3"
-    local query="${tname//_/ }"   # underscores → spaces
-    local outbase="$REF_DIR/targeted_ncbi/${taxid}_${tname}"
-    local zipfile="$outbase.zip"
-    local outdir="$outbase"
+    local query="${tname//_/ }"
+    local zipfile="$REF_DIR/targeted_ncbi/${taxid}_${tname}.zip"
+    local outdir="$REF_DIR/targeted_ncbi/${taxid}_${tname}"
 
-    # Try 1: RefSeq representatives (preferred; compact)
-    if conda run -p "$USER_ENV" datasets download genome taxon "$query" \
-         --assembly-source refseq --reference --dehydrated --filename "$zipfile" \
-         >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then
-      :
-    # Try 2: RefSeq (no representative filter)
-    elif conda run -p "$USER_ENV" datasets download genome taxon "$query" \
-         --assembly-source refseq --dehydrated --filename "$zipfile" \
-         >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then
-      :
-    # Try 3: GenBank representatives
-    elif conda run -p "$USER_ENV" datasets download genome taxon "$query" \
-         --assembly-source genbank --reference --dehydrated --filename "$zipfile" \
-         >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then
-      :
-    # Try 4: GenBank (no representative filter)
-    elif conda run -p "$USER_ENV" datasets download genome taxon "$query" \
-         --assembly-source genbank --dehydrated --filename "$zipfile" \
-         >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then
-      :
-    else
-      echo "[WARN] No assemblies for $rank $tname (taxid=$taxid). Skipping."
-      return 1
-    fi
-
-    [[ ! -s "$zipfile" ]] && { echo "[WARN] Empty package for $tname (taxid=$taxid)."; return 1; }
+    if conda run -p "$USER_ENV" datasets download genome taxon "$query" --assembly-source refseq --reference --dehydrated --filename "$zipfile" >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then :;
+    elif conda run -p "$USER_ENV" datasets download genome taxon "$query" --assembly-source refseq --dehydrated --filename "$zipfile" >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1; then :;
+    else return 1; fi
 
     mkdir -p "$outdir"
     unzip -q "$zipfile" -d "$outdir"
-    conda run -p "$USER_ENV" datasets rehydrate --directory "$outdir" \
-      >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1
-
-    # Append *_genomic.fna files to combined FASTA (Datasets package path)
-    local nfa=0
-    while IFS= read -r -d '' fna; do
-      cat "$fna" >> "$REF_DIR/targeted_microbes.fna"
-      ((nfa++))
-    done < <(find "$outdir/ncbi_dataset/data" -name "*_genomic.fna" -print0)
-
-    if [[ "$nfa" -eq 0 ]]; then
-      echo "[WARN] No genomic FASTA found for $tname (taxid=$taxid)."
-      return 1
-    else
-      echo "[OK] $tname: appended $nfa FASTA(s)."
-    fi
+    conda run -p "$USER_ENV" datasets rehydrate --directory "$outdir" >> "$REF_DIR/logs/datasets_${taxid}.log" 2>&1
+    find "$outdir/ncbi_dataset/data" -name "*_genomic.fna" -exec cat {} + >> "$REF_FASTA"
     return 0
   }
 
-  # 4) Build combined FASTA
-  : > "$REF_DIR/targeted_microbes.fna"
-  echo "[REF] Downloading & concatenating genomic FASTAs..."
-  while IFS=$'\t' read -r taxid name rank; do
-    download_taxon "$taxid" "$name" "$rank" || true
-  done < "$TLIST"
+  : > "$REF_FASTA"
+  while IFS=$'\t' read -r taxid name rank; do download_taxon "$taxid" "$name" "$rank" || true; done < "$TLIST"
+  conda run -p "$USER_ENV" seqkit rmdup -s "$REF_FASTA" > "${REF_FASTA}.tmp" && mv "${REF_FASTA}.tmp" "$REF_FASTA"
 
-  # Optional: remove exact duplicate sequences (if seqkit is available)
-  if conda run -p "$USER_ENV" which seqkit >/dev/null 2>&1; then
-    echo "[REF] Removing exact duplicates with seqkit rmdup..."
-    conda run -p "$USER_ENV" seqkit rmdup -s "$REF_DIR/targeted_microbes.fna" > "$REF_DIR/targeted_microbes.dedup.fna"
-    mv -f "$REF_DIR/targeted_microbes.dedup.fna" "$REF_DIR/targeted_microbes.fna"
-  fi
-
-  NSEQ=$(grep -c "^>" "$REF_DIR/targeted_microbes.fna" || echo 0)
-  [[ "$NSEQ" -eq 0 ]] && { echo "[ERROR] Combined FASTA is empty."; exit 1; }
-  echo "[REF] Combined FASTA has $NSEQ sequences: $REF_DIR/targeted_microbes.fna"
-
-  # 5) Build Minimap2 index (OOM-safe batching) [2](https://bioinformatics.stackexchange.com/questions/4507/better-aligner-than-bowtie2)
-  echo "[REF] Building Minimap2 index (batched, -I 4G)..."
-  minimap2 -d "$REF_DIR/targeted_microbes.mmi" "$REF_DIR/targeted_microbes.fna" -I 4G
-  echo "[REF] Index built: $REF_DIR/targeted_microbes.mmi"
-
-  echo "[REF] Targeted reference prepared."
+  echo "[REF] Building Minimap2 index..."
+  minimap2 -d "$REF_MMI" "$REF_FASTA" -I 4G
   ;;
 
-#############################################################################
-# MERGE READS — aDNA-aware overlapping merge with leeHom / leeHomMulti
-#############################################################################
 merge_reads)
-  set -euo pipefail
+  echo "[MERGE] SAMPLE=$SAMPLE"
+  module load miniconda || true
+  source activate leehom_env || true
 
-  # Prefer leeHomMulti if present (multithreaded); otherwise fall back to leeHom.
-  if command -v leeHomMulti >/dev/null 2>&1; then
-    MERGER_BIN="leeHomMulti"
-  elif command -v leeHom >/dev/null 2>&1; then
-    MERGER_BIN="leeHom"
-  else
-    module load miniconda || true
-    source activate leehom_env || true
+  MERGER_BIN="leeHom"
+  command -v leeHomMulti >/dev/null 2>&1 && MERGER_BIN="leeHomMulti"
 
-    if command -v leeHomMulti >/dev/null 2>&1; then
-      MERGER_BIN="leeHomMulti"
-    elif command -v leeHom >/dev/null 2>&1; then
-      MERGER_BIN="leeHom"
-    else
-      echo "[ERROR] leeHom/leeHomMulti not found in PATH or conda env." >&2
-      echo "        Install via: conda install -c bioconda leehom" >&2
-      exit 1
-    fi
+  OUT_PREFIX="$MERGE_DIR/${SAMPLE}.leehom"
+  ADAPTER_OPTS=(--auto)
+  [[ -n "$ADAPTER_F" && -n "$ADAPTER_R" ]] && ADAPTER_OPTS=(-f "$ADAPTER_F" -s "$ADAPTER_R")
+
+  $MERGER_BIN "${LEEHOM_OPTS[@]}" -t "$THREADS" "${ADAPTER_OPTS[@]}" \
+    -fq1 "$USE_R1" -fq2 "$USE_R2" -fqo "$OUT_PREFIX"
+
+  ln -sf "${OUT_PREFIX}.fq.gz"    "${MERGE_DIR}/${SAMPLE}.merged.fq.gz"
+  ln -sf "${OUT_PREFIX}_r1.fq.gz" "${MERGE_DIR}/${SAMPLE}.unmerged_R1.fq.gz"
+  ln -sf "${OUT_PREFIX}_r2.fq.gz" "${MERGE_DIR}/${SAMPLE}.unmerged_R2.fq.gz"
+
+  if command -v seqkit >/dev/null 2>&1; then
+    seqkit seq -m 20 "${MERGE_DIR}/${SAMPLE}.merged.fq.gz" | gzip > "${MERGE_DIR}/${SAMPLE}.merged.min20.fq.gz"
   fi
 
-  mkdir -p "$MERGE_DIR"
-
-  # SLURM array index and sample name
-  idx="${SLURM_ARRAY_TASK_ID:-0}"
-  R1="${R1_FILES[$idx]}"
-  SAMPLE="$(basename "$R1" _R1_001.fastq.gz)"
-
-  # Resolve filtered vs raw paired reads for this sample:
-  # reads_for_sample prints R1 on line1 and R2 on line2. We read both lines safely.
-  mapfile -t __PAIR < <(reads_for_sample "$SAMPLE")
-  USE_R1="${__PAIR[0]}"
-  USE_R2="${__PAIR[1]}"
-
-  # Hard stop if either is empty or unreadable
-  if [[ -z "$USE_R1" || -z "$USE_R2" || ! -r "$USE_R1" || ! -r "$USE_R2" ]]; then
-    printf '[ERROR] Cannot read one or both input files:\n  R1=%q\n  R2=%q\n' "$USE_R1" "$USE_R2" >&2
+  if [[ ! -s "${MERGE_DIR}/${SAMPLE}.merged.fq.gz" ]]; then
+    echo "[ERROR] leeHom failed to create ${MERGE_DIR}/${SAMPLE}.merged.fq.gz" >&2
     exit 1
   fi
-  printf '[MERGE] idx=%s  SAMPLE=%s\n' "${SLURM_ARRAY_TASK_ID:-0}" "$SAMPLE"
-  printf '[MERGE] Use R1: %q\n[MERGE] Use R2: %q\n' "$USE_R1" "$USE_R2"
-
-  # Outputs (leeHom writes multiple files; we’ll link them to the names used downstream)
-  OUT_PREFIX="$MERGE_DIR/${SAMPLE}.leehom"
-  MERGED="$MERGE_DIR/${SAMPLE}.merged.fq.gz"
-  UNM_R1="$MERGE_DIR/${SAMPLE}.unmerged_R1.fq.gz"
-  UNM_R2="$MERGE_DIR/${SAMPLE}.unmerged_R2.fq.gz"
-  LOGFILE="$MERGE_DIR/${SAMPLE}.leehom.log"
-
-  # Adapter handling: use configured ADAPTER_F/ADAPTER_R if set; otherwise auto-infer.
-  # leeHom requires adapter sequences unless --auto is used. [1](https://github.com/grenaud/leeHom)
-  ADAPTER_F="${ADAPTER_F:-}"
-  ADAPTER_R="${ADAPTER_R:-}"
-  ADAPTER_OPTS=()
-  if [[ -n "$ADAPTER_F" && -n "$ADAPTER_R" ]]; then
-    ADAPTER_OPTS=( -f "$ADAPTER_F" -s "$ADAPTER_R" )
-    echo "[MERGE] Using provided adapters."
-  else
-    ADAPTER_OPTS=( --auto )
-    echo "[MERGE] No adapters provided; using --auto inference."
-  fi
-
-  # Threads
-  THREADS="${SLURM_CPUS_PER_TASK:-8}"
-
-  # Run leeHom in aDNA-aware mode; write fastq outputs with prefix
-  # -fq1/-fq2 for paired inputs; -fqo for output fastq prefix; --ancientdna enables probabilistic merging
-  # tailored to short, damaged molecules. [1](https://github.com/grenaud/leeHom)[2](https://academic.oup.com/nar/article/42/18/e141/2434537)
-  {
-    echo "[MERGE] Command:"
-    echo "  $MERGER_BIN --ancientdna -t $THREADS ${ADAPTER_OPTS[*]} \\"
-    echo "    -fq1 $USE_R1 -fq2 $USE_R2 -fqo $OUT_PREFIX"
-  } | tee "$LOGFILE"
-
-  # Execute
-  # stderr (leeHom’s log/summary) is useful; keep it in $LOGFILE too.
-  $MERGER_BIN --ancientdna -t "$THREADS" "${ADAPTER_OPTS[@]}" \
-    -fq1 "$USE_R1" -fq2 "$USE_R2" -fqo "$OUT_PREFIX" 1>>"$LOGFILE" 2>>"$LOGFILE"
-
-  # Link leeHom outputs to the names used elsewhere in your pipeline
-  # Paired-end mode (fastq): [1](https://github.com/grenaud/leeHom)
-  #   [PREFIX].fq.gz         -> merged confidently
-  #   [PREFIX]_r1.fq.gz      -> forward reads not confidently merged
-  #   [PREFIX]_r2.fq.gz      -> reverse reads not confidently merged
-  #   [PREFIX].fail.fq.gz    -> merged but with low posterior support
-  ln -sf "${OUT_PREFIX}.fq.gz"    "$MERGED"
-  ln -sf "${OUT_PREFIX}_r1.fq.gz" "$UNM_R1"
-  ln -sf "${OUT_PREFIX}_r2.fq.gz" "$UNM_R2"
-
-  # Optional: drop ultra‑short merges (<20 bp). Helps downstream tools avoid 1–19 bp artifacts.
-  if command -v seqkit >/dev/null 2>&1; then
-    echo "[MERGE] Filtering merged reads <20bp..."
-    seqkit seq -m 20 "$MERGED" > "$MERGE_DIR/${SAMPLE}.merged.min20.fq"
-    gzip -f "$MERGE_DIR/${SAMPLE}.merged.min20.fq"
-    MERGED="$MERGE_DIR/${SAMPLE}.merged.min20.fq.gz"
-  fi
-
-  # Minimal summary
-  if [[ -s "$MERGED" ]]; then
-    echo "[MERGE] Merged FASTQ size (lines): $(zcat "$MERGED" | wc -l)"
-    echo "[MERGE] Example lengths (first 5 merged sequences):"
-    zcat "$MERGED" | awk 'NR%4==2{print length($0)}' | head -5
-  fi
-
-  echo "[MERGE] Done: $MERGED"
   ;;
 
-#############################################
-# MAP DAMAGE: mapping → DamageProfiler → .prof
-#############################################
 map_damage)
-  set -euo pipefail
+  echo "[MAP+DMG] SAMPLE=$SAMPLE"
+  [[ -s "$REF_MMI" ]] || { echo "[ERROR] Index missing"; exit 1; }
+  module load minimap2 samtools miniconda || true
+  source activate carpedeam_env
 
-  # --- Config knobs (override at submit time) ---
-  DP_HEAP="${DP_HEAP:-16g}"   # JVM heap for DamageProfiler
-  DP_LEN="${DP_LEN:-100}"     # Number of bases for frequency computations (DP default is 100)
-  THREADS="${SLURM_CPUS_PER_TASK:-8}"
-
-  mkdir -p "$MAP_DIR" "$DMG_DIR" "$TMP_DIR"
-
-  # --- Verify targeted reference & index ---
-  REF_FASTA_CAND=("$REF_DIR/targeted_microbes.fna" "$REF_FASTA")
-  REF_MMI="$REF_DIR/targeted_microbes.mmi"
-  REF_FASTA_FOUND=""
-  for f in "${REF_FASTA_CAND[@]}"; do
-    [[ -s "$f" ]] && REF_FASTA_FOUND="$f" && break
-  done
-  [[ -z "$REF_FASTA_FOUND" ]] && { echo "[ERROR] Reference FASTA not found."; exit 1; }
-  [[ ! -s "$REF_MMI" ]] && { echo "[ERROR] Minimap2 index missing."; exit 1; }
-
-  # --- Environment ---
-  module load minimap2   || true
-  module load samtools   || true
-  module load miniconda  || true
-  source activate carpedeam_env  # must contain DamageProfiler + Java ≥11
-
-  # --- Resolve sample + merged reads ---
-  idx="${SLURM_ARRAY_TASK_ID:-0}"
-  R1="${R1_FILES[$idx]}"
-  SAMPLE="$(basename "$R1" _R1_001.fastq.gz)"
-  MERGED_CAND=("$MERGE_DIR/${SAMPLE}.merged.min20.fq.gz" "$MERGE_DIR/${SAMPLE}.merged.fq.gz")
-  MERGED=""
-  for f in "${MERGED_CAND[@]}"; do
-    [[ -s "$f" ]] && MERGED="$f" && break
-  done
-  [[ -z "$MERGED" ]] && { echo "[ERROR] Merged reads not found for $SAMPLE"; exit 1; }
-
-  # --- Map with Minimap2 → position-sorted BAM (emit MD/NM tags) ---
-  BAM="$MAP_DIR/${SAMPLE}.merged.sorted.bam"
-  echo "[MAP] Minimap2 mapping (-x sr, --MD) → sorted BAM..."
-  minimap2 -a -x sr --MD -t "$THREADS" "$REF_MMI" "$MERGED" \
-    | samtools sort -@ "$THREADS" -o "$BAM"
+  minimap2 -a -x sr --MD -t "$THREADS" "$REF_MMI" "$INPUT_MERGED" | samtools sort -@ "$THREADS" -o "$BAM"
   samtools index "$BAM"
 
-  # --- Contigs with any mapped reads (species/header list for DP) ---
-  SPECIES_FILE="$DMG_DIR/${SAMPLE}_species.txt"
-  samtools idxstats "$BAM" \
-    | awk -F'\t' '$3 > 0 {print $1}' \
-    | sort -u > "$SPECIES_FILE"
-
-  # --- Reduced FASTA (mapped contigs only) to minimize memory ---
-  REDUCED_FASTA="$REF_DIR/targeted_microbes.hitonly.${SAMPLE}.fna"
-  if [[ -s "$SPECIES_FILE" ]]; then
-    samtools faidx "$REF_FASTA_FOUND" -r "$SPECIES_FILE" > "$REDUCED_FASTA"
-    samtools faidx "$REDUCED_FASTA"
-  else
-    # No hits found: fall back to full FASTA but still indexed
-    cp "$REF_FASTA_FOUND" "$REDUCED_FASTA"
-    [[ ! -s "${REDUCED_FASTA}.fai" ]] && samtools faidx "$REDUCED_FASTA"
-  fi
-
-  # --- Ensure MD tag exists (fallback if minimap2 --MD didn't add it) ---
-  if ! samtools view "$BAM" | head -1000 | grep -q 'MD:Z:'; then
-    echo "[MAP] MD tag not found in BAM; adding with samtools calmd..."
-    samtools calmd -b "$BAM" "$REDUCED_FASTA" > "${BAM%.bam}.calmd.bam"
-    mv "${BAM%.bam}.calmd.bam" "$BAM"
-    samtools index "$BAM"
-  fi
-
-  # --- DamageProfiler (global, no -sf) ---
-  echo "[DMG] Running DamageProfiler with reference (hit-only FASTA)..."
-  DP_OUT="$DMG_DIR/${SAMPLE}_damageprofiler"
   mkdir -p "$DP_OUT"
+  damageprofiler -i "$BAM" -r "$REF_FASTA" -o "$DP_OUT" -l "$DP_LEN"
 
-  # (Optional) print the exact command for your logs
-  echo "[DMG] Command:"
-  echo "  damageprofiler -i \"$BAM\" -r \"$REDUCED_FASTA\" -o \"$DP_OUT\" -l $DP_LEN"
-
-  # Global run: one set of freq tables directly under $DP_OUT
-  damageprofiler -i "$BAM" -r "$REDUCED_FASTA" -o "$DP_OUT" -l "$DP_LEN"
-
-  # Validate DP outputs exist (global case)
-  if [[ ! -s "$DP_OUT/5pCtoT_freq.txt" || ! -s "$DP_OUT/3pGtoA_freq.txt" ]]; then
-    echo "[ERROR] DamageProfiler did not produce freq tables." >&2
-    echo "  Checked:"
-    echo "   $DP_OUT/5pCtoT_freq.txt"
-    echo "   $DP_OUT/3pGtoA_freq.txt"
-    echo "  Hints:"
-    echo "   • Ensure BAM carries MD/NM (use minimap2 --MD or 'samtools calmd')." >&2
-    exit 1
-  fi
-
-  conda deactivate || true
-
-  # --- Convert DP outputs → CarpeDeam .prof ---
-  echo "[DMG] Converting DamageProfiler output to CarpeDeam .prof files..."
-  FREQ5="$DP_OUT/5pCtoT_freq.txt"
-  FREQ3="$DP_OUT/3pGtoA_freq.txt"
-  DMG_PREFIX="$DMG_DIR/${SAMPLE}_CarpeDeam_"
-  F5P="${DMG_PREFIX}5p.prof"
-  F3P="${DMG_PREFIX}3p.prof"
-
-  export FREQ5 FREQ3 F5P F3P
-
+  # Convert DP to CarpeDeam .prof
+  export FREQ5="$DP_OUT/5pCtoT_freq.txt"
+  export FREQ3="$DP_OUT/3pGtoA_freq.txt"
+  export F5P F3P
   python - <<'PY'
 import os, sys
 subs = ["A>C","A>G","A>T","C>A","C>G","C>T","G>A","G>C","G>T","T>A","T>C","T>G"]
-
-def need(name):
-    v = os.environ.get(name)
-    if v is None or not v:
-        sys.stderr.write(f"[ERROR] Missing environment variable: {name}\n")
-        sys.exit(2)
-    return v
-
 def read_vals(path):
     vals=[]
-    try:
-        with open(path,'r',encoding='utf-8',errors='replace') as fh:
-            for line in fh:
-                s=line.strip()
-                if not s or s.lower().startswith(('pos','position','#')):
-                    continue
-                parts = s.split('\t')
-                try:
-                    vals.append(float(parts[-1].strip()))
-                except Exception:
-                    try:
-                        vals.append(float(s.split()[-1]))
-                    except Exception:
-                        pass
-    except FileNotFoundError:
-        sys.stderr.write(f"[ERROR] Missing DP file: {path}\n")
-        sys.exit(2)
+    with open(path,'r') as f:
+        for line in f:
+            if line.lower().startswith(('pos','position','#')) or not line.strip(): continue
+            vals.append(line.strip().split('\t')[-1])
     return vals
-
-def write_prof(path, vals, which_col):
-    with open(path,'w',encoding='ascii') as out:
-        out.write("\t".join(subs) + "\n")
+def write_prof(path, vals, col):
+    with open(path,'w') as f:
+        f.write("\t".join(subs) + "\n")
         for v in vals:
-            row=[0.0]*12
-            row[which_col]=v
-            out.write("\t".join(f"{x:.10f}" for x in row) + "\n")
-
-f5p = need('F5P'); f3p = need('F3P')
-freq5 = need('FREQ5'); freq3 = need('FREQ3')
-vals5 = read_vals(freq5)
-vals3 = read_vals(freq3)
-
-if not vals5:
-    sys.stderr.write("[ERROR] No 5' C>T values read from DamageProfiler.\n")
-    sys.exit(2)
-if not vals3:
-    sys.stderr.write("[ERROR] No 3' G>A values read from DamageProfiler.\n")
-    sys.exit(2)
-
-write_prof(f5p, vals5, 5)  # C>T (5' file)
-write_prof(f3p, vals3, 6)  # G>A (3' file)
+            row=['0.0']*12; row[col]=v
+            f.write("\t".join(row) + "\n")
+v5 = read_vals(os.environ['FREQ5']); v3 = read_vals(os.environ['FREQ3'])
+write_prof(os.environ['F5P'], v5, 5); write_prof(os.environ['F3P'], v3, 6)
 PY
 
-  # Validate that both files exist and are non-empty before normalization
-  for prof in "$F5P" "$F3P"; do
-    if [[ -z "${prof:-}" ]]; then
-      echo "[ERROR] Empty .prof path variable." >&2
-      exit 1
-    fi
-    if [[ ! -s "$prof" ]]; then
-      echo "[ERROR] .prof file not created or empty: $prof" >&2
-      exit 1
-    fi
-  done
-
-  # --- Normalize and validate .prof (strict tabs; 12 fields) ---
-  normalize_prof() {
-    local prof="${1:-}"
-    [[ -z "$prof" ]] && { echo "[ERROR] normalize_prof: missing path argument." >&2; return 1; }
-    local tmp="${prof}.tmp"
-    sed -E '1s/^\xEF\xBB\xBF//; s/\xC2\xA0/ /g; s/[[:space:]]+/\t/g; s/\t$//' "$prof" | tr -d '\r' > "$tmp"
-    mv -f "$tmp" "$prof"
-  }
-
-  validate_prof() {
-    local prof="${1:-}"
-    [[ -z "$prof" ]] && { echo "[ERROR] validate_prof: missing path argument." >&2; return 1; }
-    local hdr_nf
-    hdr_nf=$(awk -F'\t' 'NR==1{print NF; exit}' "$prof")
-    [[ "${hdr_nf:-0}" -ne 12 ]] && { echo "[ERROR] Header NF=${hdr_nf} (expected 12): $prof" >&2; return 1; }
-    awk -F'\t' 'NR>1 && NF!=12{printf("[ERROR] %s: BAD line %d (NF=%d)\n", FILENAME, NR, NF); exit 1}' "$prof" || return 1
-  }
-
-  for prof in "$F5P" "$F3P"; do
-    normalize_prof "$prof"
-    validate_prof "$prof"
-  done
-
-  echo "[MAP+DMG] Stage complete for $SAMPLE."
+  # Streamlined Normalization
+  [[ -s "$F5P" && -s "$F3P" ]] || { echo "[ERROR] .prof files missing"; exit 1; }
+  sed -E 's/[[:space:]]+/\t/g; s/\t$//' -i "$F5P" "$F3P"
   ;;
 
-#############################################
-# NORMALIZE DAMAGE (array-based)
-# Harden & validate CarpeDeam .prof.
-# Enforces strict 12 TAB-separated columns; strips BOM/CR/NUL/blank lines
-#############################################
-normalize_damage)
-  set -euo pipefail
-
-  # Resolve array index & sample name
-  idx="${SLURM_ARRAY_TASK_ID:-0}"
-  R1="${R1_FILES[$idx]}"
-  SAMPLE="$(basename "$R1" _R1_001.fastq.gz)"
-
-  export LC_ALL=C LANG=C
-
-  # CarpeDeam expects <prefix>_5p.prof and <prefix>_3p.prof (README) [1](https://github.com/Integrative-Transcriptomics/DamageProfiler/blob/master/README.md)
-  DMG_PREFIX="$DMG_DIR/${SAMPLE}_CarpeDeam_"
-  F5P="${DMG_PREFIX}5p.prof"
-  F3P="${DMG_PREFIX}3p.prof"
-
-  echo "==============================================="
-  echo "[NDMG] idx=$idx SAMPLE=$SAMPLE"
-  echo "[NDMG] Prefix: $DMG_PREFIX"
-  echo "[NDMG] Files :"
-  echo "        5p: $F5P"
-  echo "        3p: $F3P"
-
-  # Existence check
-  if [[ ! -r "$F5P" || ! -r "$F3P" ]]; then
-    echo "[ERROR] Damage profiles missing for $SAMPLE. Run 'map_damage' first." >&2
-    echo "        Expected:"
-    echo "          $F5P"
-    echo "          $F3P"
-    exit 1
-  fi
-
-  # Expected header per CarpeDeam README (exact 12 tokens; TAB-separated) [1](https://github.com/Integrative-Transcriptomics/DamageProfiler/blob/master/README.md)
-  EXPECTED_HDR=$'A>C\tA>G\tA>T\tC>A\tC>G\tC>T\tG>A\tG>C\tG>T\tT>A\tT>C\tT>G'
-
-  normalize_prof() {
-    local f="${1:-}"; [[ -z "$f" ]] && { echo "[ERROR] normalize_prof: missing path." >&2; return 1; }
-    local tmp="${f}.tmp"
-    # 1) ASCII-only and remove CR/NULs (protect against editor/transfer artifacts)
-    if command -v iconv >/dev/null 2>&1; then
-      iconv -f UTF-8 -t ASCII//IGNORE "$f" | tr -d $'\r\000' > "$tmp"
-    else
-      tr -d $'\r\000' < "$f" > "$tmp"
-    fi
-    # 2) Strip BOM; trim trailing whitespace; collapse any whitespace run → single TAB
-    sed -E '1s/^\xEF\xBB\xBF//; s/[[:space:]]+$//; s/[[:space:]]+/\t/g' -i "$tmp"
-    # 3) Remove blank lines completely
-    grep -v '^[[:space:]]*$' "$tmp" > "${tmp}.noblank"
-    mv -f "${tmp}.noblank" "$f"
-  }
-
-  validate_prof() {
-    local f="${1:-}"; [[ -z "$f" ]] && { echo "[ERROR] validate_prof: missing path." >&2; return 1; }
-    local hdr
-    hdr=$(head -n1 "$f" || true)
-    if [[ "$hdr" != "$EXPECTED_HDR" ]]; then
-      echo "[ERROR] Header mismatch in: $f" >&2
-      echo "        Found   : $hdr" >&2
-      echo "        Expected: $EXPECTED_HDR" >&2
-      return 1
-    fi
-    # Strict NF=12 on header and all data lines (TAB-separated)
-    awk -F'\t' '
-      NR==1 { if (NF!=12) { printf("[ERROR] Header NF=%d (expected 12): %s\n", NF, FILENAME); exit 1 } }
-      NR>1  { if (NF!=12) { printf("[ERROR] %s: BAD line %d (NF=%d)\n", FILENAME, NR, NF); exit 1 } }
-      END   { if (NR<2) { printf("[ERROR] %s: No data rows found.\n", FILENAME); exit 1 } }
-    ' "$f"
-  }
-
-  echo "[NDMG] Normalizing..."
-  normalize_prof "$F5P"
-  normalize_prof "$F3P"
-
-  echo "[NDMG] Validating..."
-  validate_prof "$F5P"
-  validate_prof "$F3P"
-
-  echo "[NDMG] Byte dump (first 120 bytes of headers):"
-  od -An -c -N 120 "$F5P" | sed -n '1,1p'
-  od -An -c -N 120 "$F3P" | sed -n '1,1p'
-
-  rows_5p=$(( $(wc -l < "$F5P") - 1 ))
-  rows_3p=$(( $(wc -l < "$F3P") - 1 ))
-  echo "[NDMG] Rows (excluding header): 5p=$rows_5p; 3p=$rows_3p"
-
-  echo "[NDMG] OK: $SAMPLE"
-  ;;
-
-###############################################################################
-# ASSEMBLY — CarpeDeam ancient_assemble
-###############################################################################
 assemble_carpedeam)
-  set -euo pipefail
+  echo "[ASM] SAMPLE=$SAMPLE"
   module load miniconda || true
-  mkdir -p "$ASM_DIR" "$TMP_DIR"
+  source activate carpedeam_env
 
-  # Resolve sample and merged reads (prefers min20 if present)
-  idx="${SLURM_ARRAY_TASK_ID:-0}"
-  R1="${R1_FILES[$idx]}"
-  SAMPLE="$(basename "$R1" _R1_001.fastq.gz)"
-
-  MERGED_CAND=(
-    "$MERGE_DIR/${SAMPLE}.merged.min20.fq.gz"
-    "$MERGE_DIR/${SAMPLE}.merged.fq.gz"
-  )
-  MERGED=""
-  for f in "${MERGED_CAND[@]}"; do
-    [[ -s "$f" ]] && MERGED="$f" && break
-  done
-  if [[ -z "$MERGED" ]]; then
-    echo "[ERROR] Merged reads not found for $SAMPLE" >&2
-    echo "  Checked:"
-    printf '    %s\n' "${MERGED_CAND[@]}"
-    exit 1
-  fi
-
-  # Damage matrix prefix (CarpeDeam will append 5p.prof and 3p.prof)
-  DMG_PREFIX="$DMG_DIR/${SAMPLE}_CarpeDeam_"
-  F5P="${DMG_PREFIX}5p.prof"
-  F3P="${DMG_PREFIX}3p.prof"
-  if [[ ! -s "$F5P" || ! -s "$F3P" ]]; then
-    echo "[ERROR] Damage matrices missing for $SAMPLE. Run map_damage first." >&2
-    echo "  Expected:"
-    echo "    $F5P"
-    echo "    $F3P"
-    exit 1
-  fi
-
-  # Preflight: normalize headers/whitespace/CRs; re-validate strict 12-column tab separation.
-  # (This mirrors the CarpeDeam README/FAQ suggestion to fix 'Profile not 12 fields' failures.)
-  normalize_prof() {
-    local prof="$1"
-    local tmp="${prof}.tmp"
-    # Normalize: strip BOM, collapse whitespace→TAB, strip trailing TAB, remove CRs.
-    sed -E '1s/^\xEF\xBB\xBF//; s/[[:space:]]+/\t/g; s/\t$//' "$prof" | tr -d '\r' > "$tmp"
-    mv -f "$tmp" "$prof"
-  }
-  validate_prof() {
-    local prof="$1"
-    local bad=0
-    local hdr_nf
-    hdr_nf=$(awk -F'\t' 'NR==1{print NF; exit}' "$prof")
-    if [[ "${hdr_nf:-0}" -ne 12 ]]; then
-      echo "[ERROR] Header has NF=${hdr_nf} (expected 12) in: $prof" >&2
-      return 1
-    fi
-    awk -F'\t' 'NR>1 && NF!=12{printf("[ERROR] %s: BAD line %d (NF=%d)\n", FILENAME, NR, NF); exit 1}' "$prof" || true
-  }
-
-  echo "[ASM] Normalizing and validating damage matrices for $SAMPLE ..."
-  normalize_prof "$F5P"
-  normalize_prof "$F3P"
-  validate_prof "$F5P"
-  validate_prof "$F3P"
-
-  # Print a concise summary (full paths + row counts)
-  rows_5p=$(( $(wc -l < "$F5P") - 1 ))
-  rows_3p=$(( $(wc -l < "$F3P") - 1 ))
-  echo "[ASM] Damage matrices:"
-  echo "  5p: $F5P  (rows excluding header: $rows_5p)"
-  echo "  3p: $F3P  (rows excluding header: $rows_3p)"
-
-  # Prepare output and tmp directories (full paths)
-  ASM_OUT="$ASM_DIR/${SAMPLE}.carpedeam.fasta"
-  TMP_SUB="$TMP_DIR/${SAMPLE}"
   mkdir -p "$TMP_SUB"
 
-  # Activate environment and run CarpeDeam (capture detailed logs)
-  echo "[ASM] Running CarpeDeam..."
-  echo "  Command:"
-  echo "    carpedeam ancient_assemble \\"
-  echo "      $MERGED \\"
-  echo "      $ASM_OUT \\"
-  echo "      $TMP_SUB \\"
-  echo "      --ancient-damage $DMG_PREFIX \\"
-  echo "      --num-iter-reads-only 5 \\"
-  echo "      --num-iterations 12 \\"
-  echo "      --min-merge-seq-id 95 \\"
-  echo "      --min-cov-safe 2 "
-
-  source activate carpedeam_env
-  carpedeam ancient_assemble \
-    "$MERGED" \
-    "$ASM_OUT" \
-    "$TMP_SUB" \
-    --ancient-damage "$DMG_PREFIX" \
-    --num-iter-reads-only 5 \
-    --num-iterations 12 \
-    --min-merge-seq-id 95 \
-    --min-cov-safe 2 \
-    1> "$ASM_DIR/${SAMPLE}.carpedeam.out" \
-    2> "$ASM_DIR/${SAMPLE}.carpedeam.err"
-  conda deactivate || true
-
-  echo "[ASM] Done: $ASM_OUT"
-  echo "[ASM] Logs:"
-  echo "  stdout: $ASM_DIR/${SAMPLE}.carpedeam.out"
-  echo "  stderr: $ASM_DIR/${SAMPLE}.carpedeam.err"
+  carpedeam ancient_assemble "$INPUT_MERGED" "$ASM_OUT" "$TMP_SUB" \
+    --ancient-damage "$DMG_PREFIX" --num-iter-reads-only 5 --num-iterations 12 \
+    --min-merge-seq-id 95 --min-cov-safe 2
   ;;
 
-###############################################################################
-# Default
-###############################################################################
 *)
-  echo "Usage: sbatch carpedeam_pipeline.sh <stage>"
-  echo "Stages:"
-  echo "  ref_prep_targeted   # Prepare reference FASTA and minimap index (run once)"
-  echo "  merge_reads         # Merge paired reads (array job)"
-  echo "  map_damage          # Map merged reads; compute damage; create CarpeDeam .prof (array job)"
-  echo "  assemble_carpedeam  # Run CarpeDeam ancient_assemble (array job)"
+  echo "Usage: $0 <stage>"
   exit 1
   ;;
 esac
